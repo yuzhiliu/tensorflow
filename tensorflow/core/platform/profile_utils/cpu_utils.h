@@ -28,6 +28,10 @@ limitations under the License.
 #include <sys/time.h>
 #endif
 
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
+
 namespace tensorflow {
 
 namespace profile_utils {
@@ -42,7 +46,7 @@ namespace profile_utils {
 class CpuUtils {
  public:
   // Constant for invalid frequency.
-  // This value is returned when the furequency is not obtained somehow.
+  // This value is returned when the frequency is not obtained somehow.
   static constexpr int64 INVALID_FREQUENCY = -1;
   static constexpr uint64 DUMMY_CYCLE_CLOCK = 1;
 
@@ -54,6 +58,9 @@ class CpuUtils {
   static inline uint64 GetCurrentClockCycle() {
 #if defined(__ANDROID__)
     return GetCpuUtilsHelperSingletonInstance().GetCurrentClockCycle();
+// ----------------------------------------------------------------
+#elif defined(_WIN32)
+    return __rdtsc();
 // ----------------------------------------------------------------
 #elif defined(__x86_64__) || defined(__amd64__)
     uint64_t high, low;
@@ -94,16 +101,18 @@ class CpuUtils {
 #endif
   }
 
-  // Return cycle counter frequency.
-  // As this method caches the cpu frequency internally,
-  // the first call will incur overhead, but not subsequent calls.
-  #if (defined(__powerpc__) || defined(__ppc__) && ( __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)) || (defined(__s390x__))
-     static uint64 GetCycleCounterFrequency();
-  #else
-     static int64 GetCycleCounterFrequency();
-  #endif
+// Return cycle counter frequency.
+// As this method caches the cpu frequency internally,
+// the first call will incur overhead, but not subsequent calls.
+#if (defined(__powerpc__) ||                                             \
+     defined(__ppc__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)) || \
+    (defined(__s390x__))
+  static uint64 GetCycleCounterFrequency();
+#else
+  static int64 GetCycleCounterFrequency();
+#endif
 
-  // Return micro secound per each clock
+  // Return micro second per each clock
   // As this method caches the cpu frequency internally,
   // the first call will incur overhead, but not subsequent calls.
   static double GetMicroSecPerClock();

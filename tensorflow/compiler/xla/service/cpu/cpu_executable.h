@@ -47,29 +47,22 @@ namespace cpu {
 // architecture, so JIT-ed code and host code share the same ABI.
 class CpuExecutable : public Executable {
  public:
-  CpuExecutable(
-      std::unique_ptr<SimpleOrcJIT> jit,
-      std::unique_ptr<const BufferAssignment> assignment,
-      std::unique_ptr<const HloModule> hlo_module,
-      const string& entry_function_name,
-      std::unordered_map<const HloInstruction*, size_t> hlo_to_profile_idx);
+  CpuExecutable(std::unique_ptr<SimpleOrcJIT> jit,
+                std::unique_ptr<const BufferAssignment> assignment,
+                std::unique_ptr<const HloModule> hlo_module,
+                const string& entry_function_name,
+                std::unique_ptr<HloProfilePrinterData> hlo_profile_printer_data,
+                std::unique_ptr<HloProfileIndexMap> hlo_profile_index_map);
   ~CpuExecutable() override {}
 
-  StatusOr<perftools::gputools::DeviceMemoryBase> ExecuteOnStream(
-      const ServiceExecutableRunOptions* run_options,
-      tensorflow::gtl::ArraySlice<perftools::gputools::DeviceMemoryBase>
-          arguments,
-      HloExecutionProfile* hlo_execution_profile) override;
-
-  StatusOr<std::unique_ptr<ShapedBuffer>> ExecuteOnStream(
+  StatusOr<ScopedShapedBuffer> ExecuteOnStream(
       const ServiceExecutableRunOptions* run_options,
       tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
       HloExecutionProfile* hlo_execution_profile) override;
 
-  StatusOr<perftools::gputools::DeviceMemoryBase> ExecuteAsyncOnStream(
+  StatusOr<ScopedShapedBuffer> ExecuteAsyncOnStream(
       const ServiceExecutableRunOptions* run_options,
-      tensorflow::gtl::ArraySlice<perftools::gputools::DeviceMemoryBase>
-          arguments) override;
+      tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments) override;
 
   // This should be called after set_ir_module_string.
   const string& ir_module_string() const { return ir_module_string_; }
@@ -78,19 +71,12 @@ class CpuExecutable : public Executable {
     ir_module_string_ = ir_module_string;
   }
 
-  const Status EqualOrFail(const Executable& executable) {
-    // TODO(b/62952745) Implement equality test on CPU executable.
-    return Unimplemented("Equality test on CPU executable is not implemented.");
-  }
-
   static int64 ShapeSizeBytes(const Shape& shape);
-
-  std::unique_ptr<HloCostAnalysis> CreateCostAnalysis() const override;
 
   // Type of the computation function we expect in the JIT.
   using ComputeFunctionType = void (*)(
       void* /*result*/, const ExecutableRunOptions* /*run_options*/,
-      const void** /*args*/, void** /*temps*/, uint64* /*profile_counters*/);
+      const void** /*args*/, void** /*temps*/, int64* /*profile_counters*/);
 
   const ComputeFunctionType& compute_function() const {
     return compute_function_;
@@ -99,30 +85,38 @@ class CpuExecutable : public Executable {
   const BufferAssignment& buffer_assignment() const { return *assignment_; }
 
  private:
-  // Allocate buffers required for execution and assign them to the elements of
-  // "buffers". "buffers" should be sized to the number of buffers in buffer
-  // assignment. Each vector element corresponds to a particular Index. If
-  // a vector element already contains a non-null DeviceMemoryBase, then no
-  // buffer is assigned for this element.
-  Status AllocateBuffers(
-      DeviceMemoryAllocator* memory_allocator, int device_ordinal,
-      std::vector<perftools::gputools::DeviceMemoryBase>* buffers);
+  // Creates an array suitable for passing as the "temps" argument to the JIT
+  // compiled function pointer.
+  //
+  // Returns (unowning_buffers, owning_buffers) where:
+  //
+  //  - unowning_buffers.data() can be passed as the temps argument as-is and
+  //    includes pointers to the scratch storage required by the computation,
+  //    the live-out buffer into which the result will be written and entry
+  //    computation parameters.
+  //
+  //  - owning_buffers contains owning pointers to the buffers that were
+  //    allocated by this routine.  This routine allocates buffers for temporary
+  //    storage and the live-out buffer into which the computation writes it
+  //    result.
+  StatusOr<std::pair<std::vector<se::DeviceMemoryBase>,
+                     std::vector<OwningDeviceMemory>>>
+  CreateTempArray(DeviceMemoryAllocator* memory_allocator, int device_ordinal,
+                  tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments);
 
   // Calls the generated function performing the computation with the given
   // arguments using the supplied buffers.
   Status ExecuteComputeFunction(
       const ExecutableRunOptions* run_options,
-      tensorflow::gtl::ArraySlice<perftools::gputools::DeviceMemoryBase>
-          arguments,
-      tensorflow::gtl::ArraySlice<perftools::gputools::DeviceMemoryBase>
-          buffers,
+      tensorflow::gtl::ArraySlice<se::DeviceMemoryBase> buffers,
       HloExecutionProfile* hlo_execution_profile);
-  Status ExecuteComputeFunction(
-      const ExecutableRunOptions* run_options,
-      tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
-      tensorflow::gtl::ArraySlice<perftools::gputools::DeviceMemoryBase>
-          buffers,
-      HloExecutionProfile* hlo_execution_profile);
+
+  // Creates a ScopedShapedBuffer for holding the result of the computation,
+  // moving buffers out of allocated_buffers and into the result as appropriate.
+  // The addresses are set according to buffer assignment.
+  StatusOr<ScopedShapedBuffer> CreateResultShapedBuffer(
+      const ServiceExecutableRunOptions* run_options,
+      tensorflow::gtl::MutableArraySlice<OwningDeviceMemory> buffers);
 
   // Returns the points-to set of the root instruction of the entry
   // computation. Uses points-to analysis from buffer assignment.
@@ -144,9 +138,6 @@ class CpuExecutable : public Executable {
 
   // Entry function name for the computation.
   const string entry_function_name_;
-
-  // Maps HLOs to their index into the profile counter array.
-  const std::unordered_map<const HloInstruction*, size_t> hlo_to_profile_idx_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(CpuExecutable);
 };

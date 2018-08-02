@@ -44,7 +44,7 @@ It is possible to model a new
 implementation on the existing [`xla::CPUCompiler`]
 (https://www.tensorflow.org/code/tensorflow/compiler/xla/service/cpu/cpu_compiler.cc)
 and [`xla::GPUCompiler`]
-(https://www.tensorflow.org/code/tensorflow/compiler/xla/service/gpu/gpu_compiler.cc)
+(https://www.tensorflow.org/code/tensorflow/compiler/xla/service/gpu/nvptx_compiler.cc)
 classes, since these already emit LLVM IR. Depending on the nature of the
 hardware, it is possible that many of the LLVM IR generation aspects will have
 to be changed, but a lot of code can be shared with the existing backends.
@@ -62,11 +62,11 @@ If it is not possible to utilize LLVM, then the best option is to implement a
 new backend for XLA for the desired hardware. This option requires the most
 effort. The classes that need to be implemented are as follows:
 
-*   [StreamExecutor](https://www.tensorflow.org/code/tensorflow/stream_executor/stream_executor.h):
+*   [`StreamExecutor`](https://www.tensorflow.org/code/tensorflow/stream_executor/stream_executor.h):
     For many devices not all methods of `StreamExecutor` are needed. See
     existing `StreamExecutor` implementations for details.
-*   [xla::Compiler](https://www.tensorflow.org/code/tensorflow/compiler/xla/service/compiler.h):
-    This class encapsulates the compilation of a HLO computation into an
+*   [`xla::Compiler`](https://www.tensorflow.org/code/tensorflow/compiler/xla/service/compiler.h):
+    This class encapsulates the compilation of an HLO computation into an
     `xla::Executable`.
 *   [`xla::Executable`](https://www.tensorflow.org/code/tensorflow/compiler/xla/service/executable.h):
     This class is used to launch a compiled computation on the platform.

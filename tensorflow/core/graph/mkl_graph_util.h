@@ -17,7 +17,6 @@ limitations under the License.
 #define TENSORFLOW_CORE_GRAPH_MKL_GRAPH_UTIL_H_
 #ifdef INTEL_MKL
 
-#include <string>
 #include "tensorflow/core/framework/op_kernel.h"
 
 namespace tensorflow {
@@ -76,12 +75,12 @@ int inline GetTensorMetaDataIndex(int n, int total_tensors) {
 namespace mkl_op_registry {
 static const char* kMklOpLabel = "MklOp";
 static const char* kMklOpLabelPattern = "label='MklOp'";
+// Prefix that we add to Tensorflow op name to construct Mkl op name.
+static const char* const kMklOpPrefix = "_Mkl";
 
 // Get the name of Mkl op from original TensorFlow op
 // We prefix 'Mkl' to the original op to get Mkl op.
 inline string GetMklOpName(const string& name) {
-  // Prefix that we add to Tensorflow op name to construct Mkl op name.
-  const char* const kMklOpPrefix = "_Mkl";
   return string(kMklOpPrefix) + name;
 }
 
@@ -90,13 +89,10 @@ inline string GetMklOpName(const string& name) {
 // @input: name of the op
 // @input: T datatype to be used for checking op
 // @return: true if opname is registered as Mkl op; false otherwise
-static inline bool IsMklOp(const std::string& op_name, DataType T) {
+static inline bool IsMklOp(const string& op_name, DataType T) {
   string kernel = KernelsRegisteredForOp(op_name);
   bool result =
       kernel.find(kMklOpLabelPattern) != string::npos && (T == DT_FLOAT);
-  if (result) {
-    VLOG(1) << "mkl_op_registry::" << op_name << " is " << kMklOpLabel;
-  }
   return result;
 }
 
@@ -107,19 +103,16 @@ static inline bool IsMklOp(const std::string& op_name, DataType T) {
 // @input: T datatype to be used for checking op
 // @return: true if opname is registered as element-wise Mkl op;
 // false otherwise
-static inline bool IsMklElementWiseOp(const std::string& op_name, DataType T) {
+static inline bool IsMklElementWiseOp(const string& op_name, DataType T) {
   if (!IsMklOp(op_name, T)) {
     return false;
   }
-
   bool result = (0 == op_name.compare(GetMklOpName("Add")) ||
                  0 == op_name.compare(GetMklOpName("Sub")) ||
                  0 == op_name.compare(GetMklOpName("Mul")) ||
                  0 == op_name.compare(GetMklOpName("Maximum")) ||
                  0 == op_name.compare(GetMklOpName("SquaredDifference")));
 
-  VLOG(1) << "mkl_op_registry::" << op_name
-          << " is elementwise MKL op: " << result;
   return result;
 }
 }  // namespace mkl_op_registry

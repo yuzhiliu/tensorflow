@@ -29,15 +29,19 @@ limitations under the License.
 #include "tensorflow/compiler/tf2xla/xla_context.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/xla/client/client_library.h"
+#include "tensorflow/compiler/xla/client/xla_builder.h"
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/executor.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/common_runtime/graph_optimizer.h"
 #include "tensorflow/core/framework/attr_value_util.h"
+#include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/graph/algorithm.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/graph/validate.h"
+#include "tensorflow/core/lib/gtl/cleanup.h"
 #include "tensorflow/core/lib/hash/hash.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/public/version.h"
@@ -49,6 +53,7 @@ Status PrepareArguments(XlaOpKernelContext* ctx, Graph* graph,
                         const std::vector<const XlaExpression*>& expressions,
                         std::vector<XlaCompiler::Argument>* args) {
   auto builder = ctx->builder();
+  auto client = ctx->compiler()->client();
   std::vector<bool> compile_time_constant_flags(expressions.size());
 
   TF_RETURN_IF_ERROR(
@@ -58,9 +63,7 @@ Status PrepareArguments(XlaOpKernelContext* ctx, Graph* graph,
   for (int i = 0; i < args->size(); ++i) {
     XlaCompiler::Argument& arg = (*args)[i];
     arg.type = ctx->input_type(i);
-
-    TF_RETURN_IF_ERROR(
-        TensorShapeToXLAShape(arg.type, ctx->InputShape(i), &arg.shape));
+    arg.shape = ctx->InputShape(i);
 
     if (arg.type == DT_RESOURCE) {
       return errors::InvalidArgument(
@@ -72,8 +75,10 @@ Status PrepareArguments(XlaOpKernelContext* ctx, Graph* graph,
       arg.kind = XlaCompiler::Argument::kConstant;
       TF_RET_CHECK(expressions[i]->resource() == nullptr)
           << "Input with resource is not yet implemented.";
+      TF_ASSIGN_OR_RETURN(auto constant_graph, builder->BuildConstantSubGraph(
+                                                   expressions[i]->handle()));
       TF_ASSIGN_OR_RETURN(auto literal,
-                          builder->ComputeConstant(expressions[i]->handle()));
+                          client->ComputeConstant(constant_graph));
       TF_RETURN_IF_ERROR(
           LiteralToHostTensor(*literal, arg.type, &arg.constant_value));
     } else {
@@ -84,9 +89,22 @@ Status PrepareArguments(XlaOpKernelContext* ctx, Graph* graph,
 }
 }  // namespace
 Status GraphCompiler::Compile() {
-  std::vector<NodeBinding> bindings(graph_->num_node_ids());
-  std::vector<Node*> topo_sorted_nodes;
+  // Check that the graph has no illegal cycles.
+  TF_RETURN_IF_ERROR(graph::ValidateGraphHasNoCycle(*graph_));
+  // Maintain a mapping from node id to node outputs.
+  using NodeOutputs = std::vector<TensorValue>;
+  std::vector<NodeOutputs> output_registry(graph_->num_node_ids());
+  auto output_registry_cleanup = gtl::MakeCleanup([&output_registry] {
+    for (const NodeOutputs& outputs : output_registry) {
+      for (const TensorValue& value : outputs) {
+        CHECK(!value.is_ref());
+        delete value.tensor;
+      }
+    }
+  });
+
   // XLA requires determinism, generate a stable ordering from DFS.
+  std::vector<Node*> topo_sorted_nodes;
   GetReversePostOrder(*graph_, &topo_sorted_nodes,
                       /*stable_comparator=*/NodeComparatorName());
 
@@ -94,30 +112,22 @@ Status GraphCompiler::Compile() {
   PartiallySetupParams(&params);
 
   for (Node* n : topo_sorted_nodes) {
-    // Set up bindings.
-    NodeBinding& binding = bindings[n->id()];
-    binding.node = n;
-    Status s = flib_->CreateKernel(n->def(), &binding.op_kernel);
-    binding.output_attrs.resize(n->num_outputs());
+    OpKernel* op_kernel_raw = nullptr;
+    Status s = flib_->CreateKernel(n->def(), &op_kernel_raw);
+    // Transfer ownership of the kernel to a local smart pointer.
+    std::unique_ptr<OpKernel> op_kernel(op_kernel_raw);
+
     if (!s.ok()) {
-      binding.op_kernel = nullptr;
       s = AttachDef(s, *n);
       LOG(ERROR) << "Executor failed to create kernel. " << s;
       return s;
     }
-  }
 
-  // Bindings are initialized by the size of graph_->num_node_ids. However, the
-  // graph may contain dead nodes that still hold a valid node id. Thus
-  // graph_->num_node_ids could be larger than number of topo sorted nodes.
-  TF_RET_CHECK(bindings.size() >= topo_sorted_nodes.size());
-
-  for (Node* n : topo_sorted_nodes) {
     TF_RET_CHECK(!n->IsRecv() && !n->IsSend() && !n->IsSwitch())
         << "Not supported node: " << n->DebugString();
-    NodeBinding& binding = bindings[n->id()];
-    params.op_kernel = binding.op_kernel;
-    params.output_attr_array = binding.output_attrs.data();
+    params.op_kernel = op_kernel.get();
+    gtl::InlinedVector<AllocatorAttributes, 4> output_attr(n->num_outputs());
+    params.output_attr_array = output_attr.data();
 
     // tensor_inputs_ is a buffer reused across graph traversal. We clean up and
     // reinitialize the buffer before we visit a new node.
@@ -127,9 +137,11 @@ Status GraphCompiler::Compile() {
     // Set up inputs from outputs of previous nodes.
     for (auto* e : n->in_edges()) {
       if (e->IsControlEdge()) continue;
-      Node* src = e->src();
-      tensor_inputs_[e->dst_input()] =
-          bindings[src->id()].tensor_values[e->src_output()];
+      const Node* src = e->src();
+      TF_RET_CHECK(src->id() < output_registry.size());
+      const NodeOutputs& src_outputs = output_registry[src->id()];
+
+      tensor_inputs_.at(e->dst_input()) = src_outputs.at(e->src_output());
     }
 
     OpKernelContext op_context(&params, n->num_outputs());
@@ -138,28 +150,20 @@ Status GraphCompiler::Compile() {
     } else {
       device_->Compute(CHECK_NOTNULL(params.op_kernel), &op_context);
       Status s = op_context.status();
-      TF_RETURN_IF_ERROR(s);
+      if (!s.ok()) {
+        return AttachDef(s, n->def());
+      }
     }
 
     // Set up outputs. Also check if outputs from the previous computation is
     // valid.
+    NodeOutputs& outputs = output_registry[n->id()];
+    outputs.resize(n->num_outputs());
     for (int o = 0; o < n->num_outputs(); ++o) {
-      const auto tensor_val = op_context.release_output(o);
-      if (*op_context.is_output_dead() || tensor_val.tensor == nullptr) {
+      outputs[o] = op_context.release_output(o);
+      if (outputs[o].tensor == nullptr) {
         return errors::Internal("Missing xla_context ", o, "-th output from ",
-                                (*op_context.is_output_dead() ? "(dead)" : ""),
                                 SummarizeNode(*n));
-      }
-      binding.tensor_values.push_back(tensor_val);
-    }
-  }
-
-  // Clean up tensor data and op kernels.
-  for (NodeBinding& binding : bindings) {
-    delete binding.op_kernel;
-    for (auto& t : binding.tensor_values) {
-      if (!t.is_ref()) {
-        delete t.tensor;
       }
     }
   }
@@ -207,14 +211,15 @@ Status GraphCompiler::CompileFunctionalNode(Node* n,
   TF_RETURN_IF_ERROR(
       PrepareArguments(&xla_op_context, graph.get(), expressions, &arguments));
 
+  XlaCompiler::CompileOptions compile_options;
+  compile_options.is_entry_computation = false;
   XlaCompiler::CompilationResult result;
-
-  TF_RETURN_IF_ERROR(compiler->CompileFunction(XlaCompiler::CompileOptions(),
-                                               func, arguments, &result));
+  TF_RETURN_IF_ERROR(
+      compiler->CompileFunction(compile_options, func, arguments, &result));
 
   TF_RET_CHECK(arguments.size() == expressions.size());
 
-  std::vector<xla::ComputationDataHandle> handles;
+  std::vector<xla::XlaOp> handles;
   for (int64 i = 0; i < expressions.size(); ++i) {
     if (arguments[i].kind == XlaCompiler::Argument::kConstant) {
       continue;
@@ -225,14 +230,17 @@ Status GraphCompiler::CompileFunctionalNode(Node* n,
   XlaContext& context = XlaContext::Get(op_context);
   auto* b = context.builder();
 
-  auto output_handle = b->Call(*result.computation, handles);
+  auto output_handle = xla::Call(b, *result.computation, handles);
   // The output handle of `Call` computation is a tuple type. Unzip it so
   // that it can fit into future computations.
+  int computation_output = 0;
   for (int64 i = 0; i < n->num_outputs(); ++i) {
     if (result.outputs[i].is_constant) {
       xla_op_context.SetConstantOutput(i, result.outputs[i].constant_value);
     } else {
-      xla_op_context.SetOutput(i, b->GetTupleElement(output_handle, i));
+      xla_op_context.SetOutput(
+          i, xla::GetTupleElement(output_handle, computation_output));
+      ++computation_output;
     }
   }
   return b->first_error();
